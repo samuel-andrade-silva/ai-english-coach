@@ -1,0 +1,14 @@
+# Variáveis de Ambiente e Segredos (NUNCA enviar pro GitHub)
+.env
+.env.*
+!.env.example
+
+# Ambiente Virtual do Python
+.venv/
+venv/
+
+# Arquivos temporários do Python e áudio
+__pycache__/
+*.pyc
+audio_temp/
+*.mp3
