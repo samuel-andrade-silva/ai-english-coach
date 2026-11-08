@@ -1,3 +1,5 @@
+import sqlite3
+
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
@@ -8,7 +10,6 @@ from src.agent.nodes import (
     no_tavily_search,
     no_triagem_jev,
 )
-
 from src.agent.state import CoachState
 
 
@@ -78,13 +79,20 @@ builder.add_edge("conversador", END)
 # COMPILAÇÃO DO GRAFO
 # ==========================================
 
-def obter_app_grafo(
-    caminho_banco: str = "scratch/banco_coach.sqlite3",
-):
+def obter_app_grafo(caminho_banco: str = "scratch/banco_coach.sqlite3"):
     """
-    Compila o grafo com persistência SQLite
-    para gerenciamento das sessões.
+    Compila o grafo com persistência SQLite passando
+    a conexão direta ao SqliteSaver.
     """
-    checkpointer = SqliteSaver.from_conn_string(caminho_banco)
+    conn = sqlite3.connect(
+        caminho_banco,
+        check_same_thread=False,
+    )
+
+    checkpointer = SqliteSaver(conn)
 
     return builder.compile(checkpointer=checkpointer)
+
+
+# Instância compilada do grafo para o bot
+app = obter_app_grafo()
