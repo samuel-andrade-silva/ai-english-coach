@@ -7,6 +7,11 @@ class Settings(BaseSettings):
     # Telegram
     telegram_bot_token: str = ""
 
+    # Qdrant Vector DB
+    vector_db_type: str = "qdrant"
+    qdrant_url: str = "https://909f18ae-3cb3-452a-8a65-1d19d1b22112.us-east-1-1.aws.cloud.qdrant.io"
+    qdrant_api_key: str = ""
+
     # LLMs e APIs
     groq_api_key: str = ""
     groq_model: str = "openai/gpt-oss-120b"
