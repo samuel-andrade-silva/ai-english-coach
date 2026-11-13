@@ -1,4 +1,4 @@
-
+import asyncio
 import logging
 import os
 
@@ -13,12 +13,12 @@ from telegram.ext import (
 
 from config.settings import settings
 from src.agent.graph import app as graph_app
-from src.tools.anki_service import adicionar_cartao_anki
+from src.tools.anki_service import adicionar_cartao_anki, testar_conexao_anki
 
 # Tenta importar módulos de áudio (STT e TTS) caso estejam disponíveis
 try:
-    from src.audio.stt import transcrever_audio_groq
-    from src.audio.tts import gerar_audio_resposta
+    from src.services.stt import transcrever_audio_groq
+    from src.services.tts import gerar_audio_resposta
 
     AUDIO_DISPONIVEL = True
 
@@ -27,6 +27,120 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+if not AUDIO_DISPONIVEL:
+    logger.warning(
+        "Módulos de áudio (src.services.stt / src.services.tts) "
+        "não puderam ser importados — mensagens de voz ficarão desativadas."
+    )
+
+PASTA_TEMP = "scratch"
+
+
+# ==========================================
+# Helpers (deduplicação entre handlers)
+# ==========================================
+
+def _extrair_dados_erro(erro) -> dict:
+    """Normaliza um erro de fricção (dict ou objeto) para a fila do Anki."""
+    if isinstance(erro, dict):
+        correcao = (
+            erro.get("correcao_c1")
+            or erro.get("reescrita_c1")
+            or erro.get("correcao")
+            or str(erro)
+        )
+
+        explicacao = (
+            erro.get("explicacao")
+            or erro.get("explicacao_erro")
+            or "Correção C1 aplicada pelo tutor."
+        )
+
+        categoria = (
+            erro.get("categoria_erro")
+            or erro.get("tipo_erro")
+            or "Friction Error"
+        )
+
+    else:
+        correcao = getattr(erro, "correcao_c1", None) or str(erro)
+
+        explicacao = getattr(
+            erro,
+            "explicacao",
+            "Correção C1 aplicada pelo tutor.",
+        )
+
+        categoria = getattr(
+            erro,
+            "categoria_erro",
+            "Friction Error",
+        )
+
+    return {
+        "correcao_c1": correcao,
+        "explicacao": explicacao,
+        "categoria_erro": categoria,
+    }
+
+
+def _registrar_erros_sessao(
+    erros_friccao,
+    frase_original: str,
+    user_data: dict,
+) -> int:
+    """
+    Adiciona os erros do turno à fila de exportação do Anki,
+    ignorando duplicatas (mesma frase + mesma correção).
+    Retorna a quantidade de erros NOVOS adicionados.
+    """
+    fila = user_data.setdefault("erros_sessao", [])
+    novos = 0
+
+    for erro in erros_friccao or []:
+        dados = _extrair_dados_erro(erro)
+        chave = (frase_original, dados["correcao_c1"])
+
+        if any(
+            (item.get("frase_original"), item.get("correcao_c1")) == chave
+            for item in fila
+        ):
+            continue
+
+        fila.append({"frase_original": frase_original, **dados})
+        novos += 1
+
+        logger.info(
+            "🎴 [ANKI] Erro adicionado à fila da sessão: "
+            "'%s' -> '%s'",
+            frase_original,
+            dados["correcao_c1"],
+        )
+
+    return novos
+
+
+async def _processar_no_grafo(usuario_id: str, texto: str, canal: str) -> dict:
+    """Executa a esteira LangGraph (async, sem travar o event loop)."""
+    config = {"configurable": {"thread_id": usuario_id}}
+
+    estado_inicial = {
+        "usuario_id": usuario_id,
+        "frase_atual_texto": texto,
+        "canal_entrada": canal,
+    }
+
+    try:
+        return await graph_app.ainvoke(estado_inicial, config=config)
+
+    except Exception:
+        logger.exception("Falha inesperada na esteira do LangGraph.")
+        return {}
+
+
+# ==========================================
+# Comandos
+# ==========================================
 
 async def start_command(
     update: Update,
@@ -60,8 +174,8 @@ async def end_session_command(
     erros_sessao = context.user_data.get("erros_sessao", [])
 
     logger.info(
-        f"🎴 [END_SESSION] Total de erros acumulados na sessão: "
-        f"{len(erros_sessao)}"
+        "🎴 [END_SESSION] Total de erros acumulados na sessão: %d",
+        len(erros_sessao),
     )
 
     if not erros_sessao:
@@ -71,10 +185,22 @@ async def end_session_command(
         )
         return
 
+    # Verifica o Anki ANTES de tentar exportar (evita perder a fila)
+    if not testar_conexao_anki():
+        await msg_espera.edit_text(
+            "⚠️ **Não consegui falar com o AnkiConnect.**\n\n"
+            "Verifique se o Anki Desktop está aberto (com a extensão "
+            "AnkiConnect ativa) e tente `/end_session` novamente.\n"
+            "Seus erros **continuam salvos na fila** — nada foi perdido! 🔒"
+        )
+        return
+
     cartoes_criados = 0
 
     for erro in erros_sessao:
-        note_id = adicionar_cartao_anki(
+        # Chamada síncrona (urllib) roda em thread para não travar o bot
+        note_id = await asyncio.to_thread(
+            adicionar_cartao_anki,
             frase_original=erro.get("frase_original", ""),
             correcao_c1=erro.get("correcao_c1", ""),
             explicacao=erro.get("explicacao", ""),
@@ -84,16 +210,31 @@ async def end_session_command(
         if note_id:
             cartoes_criados += 1
 
-    # Limpa o histórico da sessão pós-exportação
-    context.user_data["erros_sessao"] = []
+    if cartoes_criados == len(erros_sessao):
+        # Limpa o histórico da sessão apenas se TUDO foi exportado
+        context.user_data["erros_sessao"] = []
 
-    await msg_espera.edit_text(
-        f"✅ **Sessão finalizada com sucesso!**\n\n"
-        f"🎴 **{cartoes_criados} novo(s) cartão(ões)** foram adicionados "
-        f"ao seu baralho **'English Coach::Errors'** no Anki!\n\n"
-        f"Bons estudos! 📚🚀"
-    )
+        await msg_espera.edit_text(
+            "✅ **Sessão finalizada com sucesso!**\n\n"
+            f"🎴 **{cartoes_criados} novo(s) cartão(ões)** foram adicionados "
+            "ao seu baralho **'English Coach::Errors'** no Anki!\n\n"
+            "Bons estudos! 📚🚀"
+        )
 
+    else:
+        restantes = len(erros_sessao) - cartoes_criados
+
+        await msg_espera.edit_text(
+            f"⚠️ **{cartoes_criados} cartão(ões)** criado(s), mas "
+            f"**{restantes}** falharam.\n\n"
+            "Os que falharam **continuam na fila** — tente "
+            "`/end_session` novamente."
+        )
+
+
+# ==========================================
+# Mensagens
+# ==========================================
 
 async def handle_text_message(
     update: Update,
@@ -103,88 +244,23 @@ async def handle_text_message(
     usuario_id = str(update.effective_user.id)
     texto_aluno = update.message.text
 
-    config = {"configurable": {"thread_id": usuario_id}}
+    resultado = await _processar_no_grafo(usuario_id, texto_aluno, "texto")
 
-    estado_inicial = {
-        "usuario_id": usuario_id,
-        "frase_atual_texto": texto_aluno,
-        "canal_entrada": "texto",
-    }
-
-    # Executa a esteira do LangGraph
-    resultado = graph_app.invoke(estado_inicial, config=config)
-
-    # 1. Recupera a resposta do tutor
     resposta_texto = (
         resultado.get("resposta_agente_texto")
-        or resultado.get("resposta_tutor")
-        or "I'm sorry, I couldn't process your message."
+        or "I'm sorry, I couldn't process your message. Please try again."
     )
 
-    # 2. Recupera os erros de fricção retornados pelo Evaluator
-    erros_friccao = resultado.get("erros_friccao") or []
+    novos = _registrar_erros_sessao(
+        resultado.get("erros_friccao") or [],
+        texto_aluno,
+        context.user_data,
+    )
 
-    if erros_friccao:
-        for erro in erros_friccao:
-
-            # Garante a extração dos dados, seja dict ou objeto
-            if isinstance(erro, dict):
-                correcao = (
-                    erro.get("correcao_c1")
-                    or erro.get("reescrita_c1")
-                    or erro.get("correcao")
-                    or str(erro)
-                )
-
-                explicacao = (
-                    erro.get("explicacao")
-                    or erro.get("explicacao_erro")
-                    or "Correção C1 aplicada pelo tutor."
-                )
-
-                categoria = (
-                    erro.get("categoria_erro")
-                    or erro.get("tipo_erro")
-                    or "Friction Error"
-                )
-
-            else:
-                correcao = getattr(
-                    erro,
-                    "correcao_c1",
-                    getattr(erro, "reescrita_c1", str(erro)),
-                )
-
-                explicacao = getattr(
-                    erro,
-                    "explicacao",
-                    "Correção C1 aplicada pelo tutor.",
-                )
-
-                categoria = getattr(
-                    erro,
-                    "categoria_erro",
-                    "Friction Error",
-                )
-
-            context.user_data.setdefault("erros_sessao", []).append(
-                {
-                    "frase_original": texto_aluno,
-                    "correcao_c1": correcao,
-                    "explicacao": explicacao,
-                    "categoria_erro": categoria,
-                }
-            )
-
-            logger.info(
-                f"🎴 [ANKI] Erro adicionado à fila da sessão: "
-                f"'{texto_aluno}' -> '{correcao}'"
-            )
-
-    else:
+    if not novos:
         logger.info(
-            f"ℹ️ [ANKI] Nenhum erro de fricção registrado para: "
-            f"'{texto_aluno}'"
+            "ℹ️ [ANKI] Nenhum erro de fricção registrado para: '%s'",
+            texto_aluno,
         )
 
     await update.message.reply_text(resposta_texto)
@@ -200,108 +276,88 @@ async def handle_voice_message(
     # 1. Download do áudio do Telegram
     voice_file = await update.message.voice.get_file()
 
-    os.makedirs("scratch", exist_ok=True)
+    os.makedirs(PASTA_TEMP, exist_ok=True)
 
     caminho_ogg = os.path.join(
-        "scratch",
+        PASTA_TEMP,
         f"voice_{update.message.message_id}.ogg",
+    )
+
+    caminho_mp3 = os.path.join(
+        PASTA_TEMP,
+        f"resp_{update.message.message_id}.mp3",
     )
 
     await voice_file.download_to_drive(caminho_ogg)
 
-    # 2. Transcrição STT (Groq Whisper)
-    if AUDIO_DISPONIVEL:
-        texto_transcrito = await transcrever_audio_groq(caminho_ogg)
-    else:
-        texto_transcrito = "Voice input received."
-
-    # 3. Execução no LangGraph
-    config = {"configurable": {"thread_id": usuario_id}}
-
-    estado_inicial = {
-        "usuario_id": usuario_id,
-        "frase_atual_texto": texto_transcrito,
-        "canal_entrada": "audio",
-    }
-
-    resultado = graph_app.invoke(estado_inicial, config=config)
-
-    # 4. Recupera a resposta do tutor
-    resposta_texto = (
-        resultado.get("resposta_agente_texto")
-        or resultado.get("resposta_tutor")
-        or ""
-    )
-
-    # 5. Recupera os erros de fricção
-    erros_friccao = resultado.get("erros_friccao") or []
-
-    if erros_friccao:
-        for erro in erros_friccao:
-
-            if isinstance(erro, dict):
-                correcao = (
-                    erro.get("correcao_c1")
-                    or erro.get("reescrita_c1")
-                    or erro.get("correcao")
-                    or str(erro)
+    try:
+        # 2. Transcrição STT (Groq Whisper) — função síncrona roda em
+        #    thread para não travar o event loop do bot
+        if AUDIO_DISPONIVEL:
+            try:
+                texto_transcrito = await asyncio.to_thread(
+                    transcrever_audio_groq,
+                    caminho_ogg,
                 )
-
-                explicacao = (
-                    erro.get("explicacao")
-                    or erro.get("explicacao_erro")
-                    or "Correção C1 aplicada pelo tutor."
+            except Exception as e:
+                logger.error(
+                    "❌ Falha na transcrição STT (degradação graciosa): %s", e
                 )
+                texto_transcrito = ""
+        else:
+            texto_transcrito = ""
 
-                categoria = (
-                    erro.get("categoria_erro")
-                    or erro.get("tipo_erro")
-                    or "Friction Error"
-                )
-
-            else:
-                correcao = getattr(
-                    erro,
-                    "correcao_c1",
-                    getattr(erro, "reescrita_c1", str(erro)),
-                )
-
-                explicacao = getattr(
-                    erro,
-                    "explicacao",
-                    "Correção C1 aplicada pelo tutor.",
-                )
-
-                categoria = getattr(
-                    erro,
-                    "categoria_erro",
-                    "Friction Error",
-                )
-
-            context.user_data.setdefault("erros_sessao", []).append(
-                {
-                    "frase_original": texto_transcrito,
-                    "correcao_c1": correcao,
-                    "explicacao": explicacao,
-                    "categoria_erro": categoria,
-                }
+        if not texto_transcrito:
+            await update.message.reply_text(
+                "I couldn't transcribe your audio right now. "
+                "Could you type it instead? 🙏"
             )
+            return
 
-            logger.info(
-                f"🎴 [ANKI VOICE] Erro adicionado à fila da sessão: "
-                f"'{texto_transcrito}' -> '{correcao}'"
-            )
+        # 3. Execução no LangGraph
+        resultado = await _processar_no_grafo(
+            usuario_id, texto_transcrito, "audio"
+        )
 
-    # 6. Responde por texto
-    await update.message.reply_text(resposta_texto)
+        resposta_texto = resultado.get("resposta_agente_texto") or ""
 
-    # 7. Envia áudio de resposta (TTS)
-    if AUDIO_DISPONIVEL and resposta_texto:
-        caminho_mp3 = await gerar_audio_resposta(resposta_texto)
+        _registrar_erros_sessao(
+            resultado.get("erros_friccao") or [],
+            texto_transcrito,
+            context.user_data,
+        )
 
-        with open(caminho_mp3, "rb") as audio_file:
-            await update.message.reply_voice(voice=audio_file)
+        # 4. Responde por texto
+        await update.message.reply_text(
+            resposta_texto
+            or "I processed your message, but couldn't generate a response."
+        )
 
+        # 5. Envia áudio de resposta (TTS)
+        if AUDIO_DISPONIVEL and resposta_texto:
+            try:
+                await gerar_audio_resposta(resposta_texto, caminho_mp3)
+
+                with open(caminho_mp3, "rb") as audio_file:
+                    await update.message.reply_voice(voice=audio_file)
+
+            except Exception as e:
+                logger.error(
+                    "❌ Falha no TTS (resposta enviada apenas em texto): %s", e
+                )
+
+    finally:
+        # Limpeza dos arquivos temporários de áudio
+        for caminho in (caminho_ogg, caminho_mp3):
+            try:
+                os.remove(caminho)
+            except OSError:
+                pass
+
+
+# ==========================================
+# Inicialização
+# ==========================================
 
 def rodar_bot():
     """Inicializa e roda o bot do Telegram."""
@@ -338,4 +394,8 @@ def rodar_bot():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
     rodar_bot()

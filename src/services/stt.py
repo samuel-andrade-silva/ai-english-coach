@@ -18,7 +18,11 @@ def transcrever_audio_groq(caminho_arquivo_audio: str) -> str:
     if not settings.groq_api_key:
         raise ValueError("GROQ_API_KEY não configurada no .env!")
 
-    client = Groq(api_key=settings.groq_api_key)
+    client = Groq(
+        api_key=settings.groq_api_key,
+        timeout=30.0,   # evita travar o handler em caso de rede lenta
+        max_retries=1,
+    )
 
     logger.info(
         f"Enviando arquivo '{caminho_arquivo_audio}' "

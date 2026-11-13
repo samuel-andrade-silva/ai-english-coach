@@ -1,2 +1,25 @@
+# Configuração central (pydantic-settings)
+pydantic>=2.0
 pydantic-settings>=2.0.0
 python-dotenv>=1.0.0
+
+# Bot Telegram
+python-telegram-bot>=21.0
+
+# LangGraph + persistência de sessão (SqliteSaver)
+langgraph>=0.2.0
+langgraph-checkpoint-sqlite>=2.0.0
+
+# LLM e STT (Groq)
+langchain-groq>=0.2.0
+groq>=0.11.0
+
+# Memória vetorial (Qdrant + embeddings locais)
+qdrant-client>=1.10.0
+sentence-transformers>=3.0.0
+
+# Busca web
+tavily-python>=0.5.0
+
+# TTS
+edge-tts>=6.1.0

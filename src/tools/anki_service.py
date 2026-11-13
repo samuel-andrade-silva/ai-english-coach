@@ -2,19 +2,35 @@ import logging
 import json
 import urllib.request
 
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
+
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-ANKI_CONNECT_URL = "http://localhost:8765"
 NOME_BARALHO = "English Coach::Errors"
+
+
+def obter_url_ankiconnect() -> str:
+    """
+    URL do AnkiConnect, configurável via ANKI_CONNECT_URL no .env.
+
+    - Padrão: http://localhost:8765 (Anki na mesma máquina do bot)
+    - Remoto: http://<IP_DO_ANKI>:8765 (Anki em outra máquina da rede)
+
+    Para aceitar conexões externas, no Anki Desktop acesse:
+    Ferramentas > Complementos > AnkiConnect > Configurar e ajuste:
+        "webCorsOriginList": ["*"]
+    depois reinicie o Anki.
+    """
+    return settings.anki_connect_url
 
 
 def _executar_request_ankiconnect(
     action: str,
     params: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    """Função utilitária para enviar requisições HTTP para a API local do AnkiConnect."""
+    """Função utilitária para enviar requisições HTTP para a API do AnkiConnect."""
 
     payload = {
         "action": action,
@@ -25,7 +41,7 @@ def _executar_request_ankiconnect(
     data_bytes = json.dumps(payload).encode("utf-8")
 
     req = urllib.request.Request(
-        ANKI_CONNECT_URL,
+        obter_url_ankiconnect(),
         data=data_bytes,
         headers={"Content-Type": "application/json"},
     )
@@ -44,7 +60,7 @@ def _executar_request_ankiconnect(
     except Exception as e:
         logger.error(
             f"❌ Não foi possível comunicar com o AnkiConnect "
-            f"na porta 8765: {e}"
+            f"em {obter_url_ankiconnect()}: {e}"
         )
         raise
 

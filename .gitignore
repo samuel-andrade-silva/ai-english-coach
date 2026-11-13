@@ -12,3 +12,9 @@ __pycache__/
 *.pyc
 audio_temp/
 *.mp3
+
+# Dados locais e temporários (bancos SQLite, áudios de voz, rascunhos)
+scratch/
+*.sqlite3
+*.ogg
+*.wav

@@ -1,8 +1,11 @@
+import logging
 from typing import Literal
 
 from pydantic import BaseModel
 
 from config.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 class RouterDecision(BaseModel):
@@ -36,10 +39,11 @@ def classificar_intencao_aluno(texto_aluno: str) -> dict:
 
     # Aplicação do Limiar de Confiança (Fail-Safe Econômico)
     if confianca < settings.confianca_minima_router:
-        print(
-            f"⚠️ Confiança ({confianca}) abaixo do limiar "
-            f"({settings.confianca_minima_router}). "
-            "Forçando CASUAL_CHAT."
+        logger.warning(
+            "⚠️ Confiança (%.2f) abaixo do limiar (%.2f). "
+            "Forçando CASUAL_CHAT.",
+            confianca,
+            settings.confianca_minima_router,
         )
         rota = "CASUAL_CHAT"
 
